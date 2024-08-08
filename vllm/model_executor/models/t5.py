@@ -47,7 +47,12 @@ from vllm.model_executor.weight_utils import (
 )
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding, ParallelLMHead
+)
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
 
 class T5LayerNorm(nn.Module):
 
@@ -131,6 +136,21 @@ class T5LayerFF(nn.Module):
         hidden_states = hidden_states + forwarded_states
         return hidden_states
 
+class T5RelativeAttentionBias(nn.Embedding):
+    def __init__(self, relative_attention_num_buckets, n_heads):
+        super().__init__(relative_attention_num_buckets, n_heads)
+        set_weight_attrs(self.weight, {"parallel_dim": 1, "weight_loader": self.weight_loader,})
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        tp_rank = get_tensor_model_parallel_rank()
+        parallel_dim = getattr(param, "parallel_dim", None)
+        param_data = param.data
+        if parallel_dim is not None:
+            shard_size = param_data.shape[parallel_dim]
+            start_idx = tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(parallel_dim, start_idx, shard_size)
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
 
 class T5Attention(nn.Module):
 
@@ -154,14 +174,13 @@ class T5Attention(nn.Module):
         self.n_heads = total_num_heads // tensor_model_parallel_world_size
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
-        self.q = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.k = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.v = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.o = RowParallelLinear(self.inner_dim, self.d_model, bias=False)
+        self.q = ColumnParallelLinear(self.d_model, total_num_heads * self.key_value_proj_dim, bias=False)
+        self.k = ColumnParallelLinear(self.d_model, total_num_heads * self.key_value_proj_dim, bias=False)
+        self.v = ColumnParallelLinear(self.d_model, total_num_heads * self.key_value_proj_dim, bias=False)
+        self.o = RowParallelLinear(total_num_heads * self.key_value_proj_dim, self.d_model, bias=False)
 
         if has_relative_attention_bias:
-            self.relative_attention_bias = nn.Embedding(
-                self.relative_attention_num_buckets, self.n_heads)
+            self.relative_attention_bias = T5RelativeAttentionBias(self.relative_attention_num_buckets, self.n_heads)
 
         self.is_cross = is_cross
         if self.is_decoder:
@@ -519,7 +538,7 @@ class T5ForConditionalGeneration(nn.Module):
         self.config = config
         self.model_dim = config.d_model
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -583,9 +602,6 @@ class T5ForConditionalGeneration(nn.Module):
 
             assert name in params_dict, f"{name} not in params_dict"
             param = params_dict[name]
-            assert param.shape == loaded_weight.shape, (
-                f"{name} shape mismatch between model and checkpoint: "
-                f"{param.shape} != {loaded_weight.shape}")
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
